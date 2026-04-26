@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D立方体陣取りゲーム</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#f5f5f2;display:flex;justify-content:center;padding:1rem}
+#wrap{padding:1rem 0;max-width:640px;width:100%}
+canvas{display:block;margin:0 auto;cursor:grab;touch-action:none;background:#fff;border:1px solid #ddd;border-radius:8px}
+canvas:active{cursor:grabbing}
+#ui{display:flex;align-items:center;gap:12px;margin:10px auto;width:fit-content;flex-wrap:wrap;justify-content:center}
+#status{text-align:center;font-size:14px;font-weight:500;color:#222;margin:6px 0;min-height:22px}
+#scores{display:flex;gap:20px;justify-content:center;font-size:13px;color:#666;margin-bottom:6px}
+.sc{display:flex;align-items:center;gap:5px}
+.dot{width:11px;height:11px;border-radius:50%}
+#turn-bar{display:flex;align-items:center;gap:8px;justify-content:center;margin-bottom:8px}
+#turn-dot{width:14px;height:14px;border-radius:50%;background:#E84040;transition:background .3s}
+#turn-label{font-size:13px;color:#666}
+button{font-size:13px;padding:5px 14px;cursor:pointer;border:1px solid #ccc;border-radius:6px;background:#fff}
+button:hover{background:#eee}
+#hint{font-size:11px;color:#aaa;text-align:center;margin-top:4px}
+</style>
+</head>
+<body>
+<div id="wrap">
+<div id="turn-bar"><div id="turn-dot"></div><span id="turn-label">先行：赤の番</span></div>
+<div id="status">マスをクリックして塗ってください</div>
+<div id="scores">
+  <div class="sc"><div class="dot" style="background:#E84040"></div><span id="rs">赤: 0マス</span></div>
+  <div class="sc"><div class="dot" style="background:#2979D4"></div><span id="bs">青: 0マス</span></div>
+</div>
+<canvas id="c" width="600" height="480"></canvas>
+<div id="ui">
+  <button id="resetBtn">リセット</button>
+</div>
+<div id="hint">ドラッグで回転 / マスをクリックして塗る</div>
+</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 600, H = 480;
+
+let rotX = 0.45, rotY = 0.6;
+let drag = false, lastX, lastY;
+let turn = 1;
+let gameOver = false;
+const board = Array(6).fill(null).map(() => Array(9).fill(0));
+
+// Face definitions
+// Cube from -1.5 to 1.5 in each axis, cells are 1 unit wide
+// Faces: 0=Top(y=1.5), 1=Front(z=1.5), 2=Right(x=1.5), 3=Bottom(y=-1.5), 4=Back(z=-1.5), 5=Left(x=-1.5)
+const S = 1.5;
+const faces = [
+  {n:[0,1,0],  u:[1,0,0],  v:[0,0,-1], o:[-S,S,S]},   // Top
+  {n:[0,0,1],  u:[1,0,0],  v:[0,-1,0], o:[-S,S,S]},    // Front
+  {n:[1,0,0],  u:[0,0,-1], v:[0,-1,0], o:[S,S,S]},     // Right
+  {n:[0,-1,0], u:[1,0,0],  v:[0,0,1],  o:[-S,-S,-S]},  // Bottom
+  {n:[0,0,-1], u:[-1,0,0], v:[0,-1,0], o:[S,S,-S]},    // Back
+  {n:[-1,0,0], u:[0,0,1],  v:[0,-1,0], o:[-S,S,-S]},   // Left
+];
+
+// Build vertex map: vertex 3D key -> [{face, cellIdx}]
+function vkey(x,y,z){return `${Math.round(x*2)},${Math.round(y*2)},${Math.round(z*2)}`}
+
+function cellCorners3D(fi, cr, cc) {
+  const f = faces[fi];
+  const pts = [];
+  for(let dr=0;dr<=1;dr++) for(let dc=0;dc<=1;dc++){
+    pts.push([
+      f.o[0]+f.u[0]*(cc+dc)+f.v[0]*(cr+dr),
+      f.o[1]+f.u[1]*(cc+dc)+f.v[1]*(cr+dr),
+      f.o[2]+f.u[2]*(cc+dc)+f.v[2]*(cr+dr),
+    ]);
+  }
+  return pts;
+}
+
+const vertexMap = {};
+for(let fi=0;fi<6;fi++) for(let cr=0;cr<3;cr++) for(let cc=0;cc<3;cc++){
+  const cidx=cr*3+cc;
+  const corners=cellCorners3D(fi,cr,cc);
+  for(const p of corners){
+    const k=vkey(...p);
+    if(!vertexMap[k]) vertexMap[k]=[];
+    if(!vertexMap[k].find(e=>e.face===fi&&e.cellIdx===cidx))
+      vertexMap[k].push({face:fi,cellIdx:cidx});
+  }
+}
+
+// 3D rotation (X then Y axis)
+function rotatePoint(p){
+  let [x,y,z]=p;
+  let y2=y*Math.cos(rotX)-z*Math.sin(rotX);
+  let z2=y*Math.sin(rotX)+z*Math.cos(rotX);
+  let x3=x*Math.cos(rotY)+z2*Math.sin(rotY);
+  let z3=-x*Math.sin(rotY)+z2*Math.cos(rotY);
+  return [x3,y2,z3];
+}
+
+const SCALE=90, OX=W/2, OY=H/2;
+
+function project(p){
+  const [x,y,z]=rotatePoint(p);
+  const fov=6;
+  const s=fov/(fov+z+3);
+  return [OX+x*SCALE*s, OY-y*SCALE*s, z];
+}
+
+function getCellCenter3D(fi,cr,cc){
+  const f=faces[fi];
+  return [
+    f.o[0]+f.u[0]*(cc+0.5)+f.v[0]*(cr+0.5),
+    f.o[1]+f.u[1]*(cc+0.5)+f.v[1]*(cr+0.5),
+    f.o[2]+f.u[2]*(cc+0.5)+f.v[2]*(cr+0.5),
+  ];
+}
+
+function getCellCorners2D(fi,cr,cc){
+  const f=faces[fi];
+  const pts=[];
+  for(let dr=0;dr<=1;dr++) for(let dc=0;dc<=1;dc++){
+    const p3=[
+      f.o[0]+f.u[0]*(cc+dc)+f.v[0]*(cr+dr),
+      f.o[1]+f.u[1]*(cc+dc)+f.v[1]*(cr+dr),
+      f.o[2]+f.u[2]*(cc+dc)+f.v[2]*(cr+dr),
+    ];
+    pts.push(project(p3));
+  }
+  return [[pts[0][0],pts[0][1]],[pts[1][0],pts[1][1]],[pts[3][0],pts[3][1]],[pts[2][0],pts[2][1]]];
+}
+
+function isFaceVisible(fi){
+  const f=faces[fi];
+  const [nx,ny,nz]=rotatePoint(f.n);
+  return nz<0;
+}
+
+function getFaceDepth(fi){
+  const c=getCellCenter3D(fi,1,1);
+  return rotatePoint(c)[2];
+}
+
+// Cell colors
+const CELL_COLORS={0:'rgba(220,218,210,0.85)', 1:'#E84040', 2:'#2979D4'};
+const CELL_STROKE={0:'rgba(100,100,100,0.4)', 1:'#B02020', 2:'#1255A0'};
+const CELL_HOVER='rgba(180,175,165,0.95)';
+
+let hoveredCell=null;
+let winCells=[];
+
+function drawCell(fi,cr,cc,highlight){
+  if(!isFaceVisible(fi)) return;
+  const pts=getCellCorners2D(fi,cr,cc);
+  const cidx=cr*3+cc;
+  const state=board[fi][cidx];
+  const isWin=winCells.find(w=>w.face===fi&&w.cellIdx===cidx);
+
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0],pts[0][1]);
+  for(let i=1;i<4;i++) ctx.lineTo(pts[i][0],pts[i][1]);
+  ctx.closePath();
+
+  if(isWin){
+    ctx.fillStyle=state===1?'#FF8080':'#80C0FF';
+  } else if(highlight&&state===0){
+    ctx.fillStyle=CELL_HOVER;
+  } else {
+    ctx.fillStyle=CELL_COLORS[state];
+  }
+  ctx.fill();
+  ctx.strokeStyle=CELL_STROKE[state]||(state===0?'rgba(80,80,80,0.35)':'#000');
+  ctx.lineWidth=state>0?2:0.8;
+  ctx.stroke();
+}
+
+function render(){
+  ctx.clearRect(0,0,W,H);
+  const order=[0,1,2,3,4,5].sort((a,b)=>getFaceDepth(b)-getFaceDepth(a));
+  for(const fi of order){
+    if(!isFaceVisible(fi)) continue;
+    for(let cr=0;cr<3;cr++) for(let cc=0;cc<3;cc++){
+      const isHov=hoveredCell&&hoveredCell.face===fi&&hoveredCell.cellIdx===cr*3+cc;
+      drawCell(fi,cr,cc,isHov);
+    }
+  }
+}
+
+function pointInPoly(px,py,pts){
+  let inside=false;
+  const n=pts.length;
+  for(let i=0,j=n-1;i<n;j=i++){
+    const xi=pts[i][0],yi=pts[i][1],xj=pts[j][0],yj=pts[j][1];
+    if(((yi>py)!==(yj>py))&&(px<(xj-xi)*(py-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+
+function getHitCell(mx,my){
+  const order=[0,1,2,3,4,5].sort((a,b)=>getFaceDepth(a)-getFaceDepth(b));
+  for(const fi of order){
+    if(!isFaceVisible(fi)) continue;
+    for(let cr=0;cr<3;cr++) for(let cc=0;cc<3;cc++){
+      const pts=getCellCorners2D(fi,cr,cc);
+      if(pointInPoly(mx,my,pts)) return {face:fi,cellIdx:cr*3+cc};
+    }
+  }
+  return null;
+}
+
+function checkWin(color){
+  for(const [vk,cells] of Object.entries(vertexMap)){
+    if(cells.length>=3&&cells.every(c=>board[c.face][c.cellIdx]===color))
+      return cells;
+  }
+  return null;
+}
+
+function updateUI(){
+  const r=board.flat().filter(v=>v===1).length;
+  const b=board.flat().filter(v=>v===2).length;
+  document.getElementById('rs').textContent=`赤: ${r}マス`;
+  document.getElementById('bs').textContent=`青: ${b}マス`;
+  document.getElementById('turn-dot').style.background=turn===1?'#E84040':'#2979D4';
+  document.getElementById('turn-label').textContent=turn===1?'先行：赤の番':'後攻：青の番';
+}
+
+// Mouse events
+canvas.addEventListener('mousemove',e=>{
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left,my=e.clientY-r.top;
+  if(drag){
+    rotY+=(mx-lastX)*0.01;
+    rotX+=(my-lastY)*0.01;
+    lastX=mx;lastY=my;
+    hoveredCell=null;
+    render();
+  } else {
+    hoveredCell=gameOver?null:getHitCell(mx,my);
+    render();
+  }
+});
+
+canvas.addEventListener('mousedown',e=>{
+  const r=canvas.getBoundingClientRect();
+  lastX=e.clientX-r.left;lastY=e.clientY-r.top;
+  canvas._dragStart={x:lastX,y:lastY};
+  canvas._moved=false;
+  drag=true;
+});
+
+canvas.addEventListener('mouseup',e=>{
+  drag=false;
+  if(!canvas._moved&&!gameOver){
+    const r=canvas.getBoundingClientRect();
+    const mx=e.clientX-r.left,my=e.clientY-r.top;
+    const hit=getHitCell(mx,my);
+    if(hit&&board[hit.face][hit.cellIdx]===0){
+      board[hit.face][hit.cellIdx]=turn;
+      const w=checkWin(turn);
+      if(w){
+        winCells=w;gameOver=true;
+        const cn=turn===1?'赤':'青';
+        document.getElementById('status').textContent=cn+'の勝利！頂点を制覇しました！';
+        document.getElementById('turn-label').textContent=cn+'が勝利！';
+      } else {
+        const tot=board.flat().filter(v=>v!==0).length;
+        if(tot===54){
+          gameOver=true;
+          document.getElementById('status').textContent='引き分け！全マスが塗られました。';
+        } else {
+          turn=turn===1?2:1;
+          document.getElementById('status').textContent='マスをクリックして塗ってください';
+        }
+      }
+      updateUI();render();
+    }
+  }
+  canvas._moved=false;
+});
+
+canvas.addEventListener('mousemove',e=>{
+  if(!drag) return;
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left,my=e.clientY-r.top;
+  const dx=mx-canvas._dragStart.x,dy=my-canvas._dragStart.y;
+  if(Math.abs(dx)>4||Math.abs(dy)>4) canvas._moved=true;
+});
+
+canvas.addEventListener('mouseleave',()=>{drag=false;hoveredCell=null;render();});
+
+// Touch events
+canvas.addEventListener('touchstart',e=>{
+  e.preventDefault();
+  const t=e.touches[0];
+  const r=canvas.getBoundingClientRect();
+  lastX=t.clientX-r.left;lastY=t.clientY-r.top;
+  canvas._dragStart={x:lastX,y:lastY};
+  canvas._moved=false;
+},{passive:false});
+
+canvas.addEventListener('touchmove',e=>{
+  e.preventDefault();
+  const t=e.touches[0];
+  const r=canvas.getBoundingClientRect();
+  const mx=t.clientX-r.left,my=t.clientY-r.top;
+  const dx=mx-lastX,dy=my-lastY;
+  if(Math.abs(dx)>3||Math.abs(dy)>3) canvas._moved=true;
+  rotY+=dx*0.01;rotX+=dy*0.01;
+  lastX=mx;lastY=my;
+  render();
+},{passive:false});
+
+canvas.addEventListener('touchend',e=>{
+  e.preventDefault();
+  if(!canvas._moved&&!gameOver){
+    const t=e.changedTouches[0];
+    const r=canvas.getBoundingClientRect();
+    const mx=t.clientX-r.left,my=t.clientY-r.top;
+    const hit=getHitCell(mx,my);
+    if(hit&&board[hit.face][hit.cellIdx]===0){
+      board[hit.face][hit.cellIdx]=turn;
+      const w=checkWin(turn);
+      if(w){
+        winCells=w;gameOver=true;
+        const cn=turn===1?'赤':'青';
+        document.getElementById('status').textContent=cn+'の勝利！頂点を制覇しました！';
+        document.getElementById('turn-label').textContent=cn+'が勝利！';
+      } else {
+        turn=turn===1?2:1;
+        document.getElementById('status').textContent='マスをクリックして塗ってください';
+      }
+      updateUI();render();
+    }
+  }
+},{passive:false});
+
+// Reset
+document.getElementById('resetBtn').addEventListener('click',()=>{
+  for(let i=0;i<6;i++) for(let j=0;j<9;j++) board[i][j]=0;
+  turn=1;gameOver=false;winCells=[];hoveredCell=null;
+  document.getElementById('status').textContent='マスをクリックして塗ってください';
+  document.getElementById('turn-label').textContent='先行：赤の番';
+  updateUI();render();
+});
+
+updateUI();
+render();
+</script>
+</body>
+</html>
